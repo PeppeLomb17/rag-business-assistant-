@@ -1,0 +1,17 @@
+# Core
+pydantic>=2.0,<3.0
+pydantic-settings>=2.0,<3.0
+
+# Document processing
+pymupdf>=1.24
+openpyxl>=3.1
+python-docx>=1.1
+
+# Vector store
+chromadb>=0.5
+
+# HTTP (per Ollama)
+requests>=2.31
+
+# Testing
+pytest>=8.0
