@@ -33,6 +33,7 @@ class Settings(BaseSettings):
 
     # Telegram
     telegram_token: SecretStr = SecretStr("")
+    telegram_allowed_users: str = ""
 
     # Paths
     documents_dir: str = "./documents"

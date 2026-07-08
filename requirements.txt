@@ -13,5 +13,8 @@ chromadb>=0.5
 # HTTP (per Ollama)
 requests>=2.31
 
+# Telegram
+python-telegram-bot>=21.0
+
 # Testing
 pytest>=8.0
