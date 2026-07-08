@@ -11,9 +11,17 @@ build/
 # ChromaDB
 chroma_db/
 
-# Documenti aziendali (dati privati)
-documents/*
-!documents/.gitkeep
+# Documenti aziendali (dati privati, solo gitkeep)
+documents/**/*.pdf
+documents/**/*.xlsx
+documents/**/*.xls
+documents/**/*.csv
+documents/**/*.txt
+documents/**/*.docx
+!documents/**/.gitkeep
+
+# File temporanei Excel
+~$*
 
 # Environment variables
 .env

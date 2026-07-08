@@ -1,9 +1,10 @@
 """
 Servizio di indicizzazione documenti.
 
-Orchestrazione completa: scansiona una cartella, carica ogni file
-con il loader appropriato, lo chunka con la strategia giusta,
-genera gli embedding e salva tutto nel vector store.
+Supporta cartelle annidate: scansiona ricorsivamente tutte le
+sottocartelle di documents/. Il nome della cartella viene
+iniettato nei chunk come categoria (es: "DDT PDF", "Fatture Airone")
+per migliorare il retrieval.
 """
 
 import logging
@@ -26,7 +27,7 @@ class IngestionService:
         self.store = store
 
     def ingest_directory(self, directory: str) -> dict:
-        """Indicizza tutti i documenti supportati in una directory."""
+        """Indicizza tutti i documenti supportati, incluse sottocartelle."""
         t_start = time.perf_counter()
 
         dir_path = Path(directory)
@@ -35,11 +36,15 @@ class IngestionService:
         if not dir_path.is_dir():
             raise ValueError(f"Non è una directory: {directory}")
 
+        # rglob("*") scansiona ricorsivamente tutte le sottocartelle
         supported = set(supported_extensions())
-        files = [
-            f for f in sorted(dir_path.iterdir())
-            if f.is_file() and f.suffix.lower() in supported
-        ]
+        files = sorted([
+            f for f in dir_path.rglob("*")
+            if f.is_file()
+            and f.suffix.lower() in supported
+            and not f.name.startswith(".")  # ignora file nascosti
+            and not f.name.startswith("~")  # ignora file temporanei Excel
+        ])
 
         logger.info(f"Trovati {len(files)} file supportati in {directory}")
 
@@ -57,7 +62,10 @@ class IngestionService:
 
         for file_path in files:
             try:
-                file_chunks = self._process_file(str(file_path))
+                # Calcola la categoria dalla sottocartella
+                category = self._get_category(file_path, dir_path)
+
+                file_chunks = self._process_file(str(file_path), category)
                 all_chunks.extend(file_chunks)
                 files_processed += 1
 
@@ -65,7 +73,7 @@ class IngestionService:
                 documents_created += len(doc_ids)
 
                 logger.info(
-                    f"  ✓ {file_path.name}: "
+                    f"  ✓ [{category}] {file_path.name}: "
                     f"{len(doc_ids)} doc, {len(file_chunks)} chunk"
                 )
 
@@ -98,13 +106,17 @@ class IngestionService:
             raise FileNotFoundError(f"File non trovato: {file_path}")
 
         try:
-            chunks = self._process_file(file_path)
+            # Prova a ricavare la categoria dal path
+            docs_dir = Path("./documents").resolve()
+            category = self._get_category(path.resolve(), docs_dir)
+
+            chunks = self._process_file(file_path, category)
             self._embed_and_store(chunks)
 
             doc_ids = set(c.doc_id for c in chunks)
 
             logger.info(
-                f"Indicizzato {path.name}: "
+                f"Indicizzato [{category}] {path.name}: "
                 f"{len(doc_ids)} doc, {len(chunks)} chunk"
             )
 
@@ -130,8 +142,31 @@ class IngestionService:
                 t_start=t_start,
             )
 
-    def _process_file(self, file_path: str) -> list[Chunk]:
-        """Pipeline per singolo file: load → chunk → inject source name."""
+    def _get_category(self, file_path: Path, base_dir: Path) -> str:
+        """Ricava la categoria dal nome della sottocartella.
+
+        Esempi:
+            documents/DDT PDF/DDT 1E.pdf      → "DDT PDF"
+            documents/Fatture Airone/f001.pdf  → "Fatture Airone"
+            documents/Campagna.xlsx            → "Generale"
+
+        Se il file è direttamente in documents/ (senza sottocartella),
+        la categoria è "Generale".
+        """
+        try:
+            relative = file_path.resolve().relative_to(base_dir.resolve())
+            parts = relative.parts
+
+            if len(parts) > 1:
+                # Il primo elemento è la sottocartella
+                return parts[0]
+            else:
+                return "Generale"
+        except ValueError:
+            return "Generale"
+
+    def _process_file(self, file_path: str, category: str = "Generale") -> list[Chunk]:
+        """Pipeline per singolo file: load → chunk → inject metadata."""
         loader = get_loader(file_path)
         documents = loader.load(file_path)
 
@@ -146,14 +181,16 @@ class IngestionService:
             chunker = get_chunker(doc)
             chunks = chunker.chunk(doc)
 
-            # Inietta il nome del file all'inizio di ogni chunk.
-            # Questo permette alla semantic search di trovare chunk
-            # per nome documento (es: "DDT 219E") perché il nome
-            # diventa parte del testo embeddato.
+            # Inietta categoria e nome file all'inizio di ogni chunk
             for chunk in chunks:
-                chunk.text = f"[Documento: {doc.source_name}]\n{chunk.text}"
+                chunk.text = (
+                    f"[Categoria: {category}] "
+                    f"[Documento: {doc.source_name}]\n"
+                    f"{chunk.text}"
+                )
                 chunk.char_count = len(chunk.text)
                 chunk.word_count = len(chunk.text.split())
+                chunk.metadata["category"] = category
 
             all_chunks.extend(chunks)
 
@@ -184,7 +221,6 @@ class IngestionService:
         errors: list,
         t_start: float,
     ) -> dict:
-        """Costruisce il report dell'operazione."""
         elapsed = time.perf_counter() - t_start
 
         report = {
