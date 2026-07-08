@@ -1,22 +1,9 @@
 """
 Embedder che usa Ollama per generare vettori localmente.
 
-Ollama espone un'API REST locale su http://localhost:11434.
-L'endpoint /api/embeddings accetta un testo e restituisce un
-vettore numerico. Tutto gira sulla macchina — nessun dato
-esce verso server esterni.
-
-Il modello bge-m3 è multilingua: mappa testi in italiano,
-inglese e altre lingue nello stesso spazio vettoriale.
-Questo significa che una query in italiano può trovare chunk
-in inglese e viceversa — esattamente il problema che avevamo
-nel progetto base con nomic-embed-text.
-
-Nota tecnica: l'API di Ollama non supporta il batching nativo
-per gli embedding (a differenza di OpenAI). Il metodo embed_batch()
-chiama embed() in sequenza. Se in futuro Ollama aggiungesse il
-batching, basterebbe modificare questo metodo senza toccare
-nient'altro nel sistema.
+Include una safety net per testi troppo lunghi: se un chunk
+supera il limite del modello, viene troncato automaticamente.
+bge-m3 ha un context window di 8192 token.
 """
 
 import logging
@@ -28,18 +15,15 @@ from rag_assistant.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Limite conservativo in caratteri.
+# bge-m3: 8192 token. La tokenizzazione varia, ma
+# 8000 caratteri è un limite sicuro per testi misti
+# (numeri, simboli, testo) come DDT e fatture.
+MAX_TEXT_CHARS = 3000
+
 
 class OllamaEmbedder(Embedder):
-    """Genera embedding tramite Ollama locale.
-
-    Args:
-        model: nome del modello embedding. Default dal config.
-        base_url: URL del server Ollama. Default dal config.
-        timeout: timeout in secondi per ogni richiesta.
-                 Gli embedding sono veloci (~100ms per chunk),
-                 ma su testi lunghi o macchine cariche può servire
-                 più tempo.
-    """
+    """Genera embedding tramite Ollama locale."""
 
     def __init__(
         self,
@@ -52,21 +36,13 @@ class OllamaEmbedder(Embedder):
         self.timeout = timeout
 
     def embed(self, text: str) -> list[float]:
-        """Genera l'embedding di un singolo testo.
+        """Genera l'embedding di un singolo testo."""
+        if len(text) > MAX_TEXT_CHARS:
+            logger.warning(
+                f"Testo troncato da {len(text)} a {MAX_TEXT_CHARS} caratteri"
+            )
+            text = text[:MAX_TEXT_CHARS]
 
-        Chiama l'API /api/embeddings di Ollama e restituisce
-        il vettore risultante.
-
-        Args:
-            text: testo da vettorizzare.
-
-        Returns:
-            Lista di float (es: 1024 dimensioni per bge-m3).
-
-        Raises:
-            ConnectionError: se Ollama non è raggiungibile.
-            RuntimeError: se la risposta è malformata.
-        """
         try:
             response = requests.post(
                 f"{self.base_url}/api/embeddings",
@@ -99,25 +75,31 @@ class OllamaEmbedder(Embedder):
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
         """Genera embedding per una lista di testi.
 
-        Ollama non supporta batching nativo per gli embedding,
-        quindi processiamo in sequenza. Il logging mostra il
-        progresso per batch lunghi.
-
-        Args:
-            texts: lista di testi da vettorizzare.
-
-        Returns:
-            Lista di vettori, uno per ogni testo.
+        Se un singolo testo fallisce, logga l'errore e usa un
+        vettore zero come fallback. Un chunk problematico non
+        deve bloccare l'indicizzazione di 900 chunk validi.
         """
         embeddings = []
         total = len(texts)
+        failures = 0
 
         for i, text in enumerate(texts):
-            embedding = self.embed(text)
-            embeddings.append(embedding)
+            try:
+                embedding = self.embed(text)
+                embeddings.append(embedding)
+            except (RuntimeError, ConnectionError) as e:
+                logger.error(f"Embedding fallito per chunk {i}: {e}")
+                if embeddings:
+                    zero_vec = [0.0] * len(embeddings[0])
+                else:
+                    zero_vec = [0.0] * 1024
+                embeddings.append(zero_vec)
+                failures += 1
 
-            # Log progresso ogni 20 chunk
             if (i + 1) % 20 == 0 or (i + 1) == total:
                 logger.info(f"Embedding: {i + 1}/{total}")
+
+        if failures:
+            logger.warning(f"Embedding completato con {failures} errori su {total}")
 
         return embeddings
