@@ -1,19 +1,12 @@
 """
 Interfaccia a riga di comando per il RAG assistant.
 
-Questo è il Composition Root dell'applicazione: il punto dove
-le implementazioni concrete vengono istanziate e collegate ai
-service tramite le interfacce astratte.
-
-Due modalità:
-1. Indicizzazione: scansiona la cartella documenti e crea il vector store
-2. Query interattiva: loop domanda-risposta
-
-Comandi speciali durante la sessione interattiva:
-    q / quit / exit  → esci
-    /reindex         → re-indicizza tutti i documenti
-    /status          → mostra statistiche del vector store
-    /help            → mostra i comandi disponibili
+Comandi:
+    /reindex  → cancella tutto e re-indicizza da zero
+    /update   → indicizza solo file nuovi (incrementale)
+    /status   → statistiche
+    /help     → comandi
+    q         → esci
 """
 
 import logging
@@ -28,12 +21,6 @@ from rag_assistant.services.rag_service import RAGService
 
 
 def _setup_logging() -> None:
-    """Configura il logging in base al livello nel config.
-
-    Il formato include timestamp, livello e messaggio.
-    In produzione useremmo un formato strutturato (JSON),
-    per la CLI il formato leggibile è più pratico.
-    """
     logging.basicConfig(
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
         format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
@@ -41,21 +28,11 @@ def _setup_logging() -> None:
     )
 
 
-def _create_services() -> tuple[IngestionService, RAGService]:
-    """Composition Root: crea e collega tutti i componenti.
-
-    Questa funzione è l'unico punto del codice che conosce le
-    implementazioni concrete. Tutto il resto lavora con interfacce.
-
-    Returns:
-        Tupla (IngestionService, RAGService) pronti all'uso.
-    """
-    # Adapter concreti
+def _create_services() -> tuple[IngestionService, RAGService, ChromaStore]:
     embedder = OllamaEmbedder()
     store = ChromaStore()
     llm = OllamaLLM()
 
-    # Service
     ingestion = IngestionService(embedder=embedder, store=store)
     rag = RAGService(
         embedder=embedder,
@@ -68,7 +45,6 @@ def _create_services() -> tuple[IngestionService, RAGService]:
 
 
 def _print_header() -> None:
-    """Stampa l'header dell'applicazione."""
     print()
     print("=" * 60)
     print("  RAG Business Assistant")
@@ -78,10 +54,10 @@ def _print_header() -> None:
 
 
 def _print_help() -> None:
-    """Stampa i comandi disponibili."""
     print()
     print("Comandi disponibili:")
-    print("  /reindex  — re-indicizza tutti i documenti")
+    print("  /update   — indicizza solo file nuovi (veloce)")
+    print("  /reindex  — cancella tutto e re-indicizza da zero")
     print("  /status   — statistiche del vector store")
     print("  /help     — mostra questo messaggio")
     print("  q         — esci")
@@ -91,10 +67,10 @@ def _print_help() -> None:
 
 
 def _print_report(report: dict) -> None:
-    """Stampa il report di indicizzazione in modo leggibile."""
     print()
     print(f"  File trovati:     {report['files_found']}")
     print(f"  File processati:  {report['files_processed']}")
+    print(f"  File saltati:     {report['files_skipped']}")
     print(f"  File con errori:  {report['files_failed']}")
     print(f"  Documenti creati: {report['documents_created']}")
     print(f"  Chunk creati:     {report['chunks_created']}")
@@ -108,19 +84,28 @@ def _print_report(report: dict) -> None:
     print()
 
 
-def _do_reindex(ingestion: IngestionService, store) -> None:
-    """Esegue la re-indicizzazione completa."""
+def _do_reindex(ingestion: IngestionService, store: ChromaStore) -> None:
+    """Re-indicizzazione completa: cancella tutto e riparte."""
     print()
-    print(f"Indicizzazione di: {settings.documents_dir}")
+    print(f"Indicizzazione COMPLETA di: {settings.documents_dir}")
     print("-" * 40)
 
     store.clear()
-    report = ingestion.ingest_directory(settings.documents_dir)
+    report = ingestion.ingest_directory(settings.documents_dir, force=True)
     _print_report(report)
 
 
-def _do_status(store) -> None:
-    """Mostra lo stato del vector store."""
+def _do_update(ingestion: IngestionService) -> None:
+    """Indicizzazione incrementale: solo file nuovi."""
+    print()
+    print(f"Indicizzazione INCREMENTALE di: {settings.documents_dir}")
+    print("-" * 40)
+
+    report = ingestion.ingest_directory(settings.documents_dir, force=False)
+    _print_report(report)
+
+
+def _do_status(store: ChromaStore) -> None:
     print()
     print(f"  Cartella documenti: {settings.documents_dir}")
     print(f"  Vector store:       {settings.chroma_persist_dir}")
@@ -133,24 +118,22 @@ def _do_status(store) -> None:
 
 
 def _do_query(rag: RAGService, question: str) -> None:
-    """Esegue una query e stampa la risposta."""
     response = rag.query(question)
 
     if not response.success:
         print(f"\n  ✗ Errore: {response.error}\n")
         return
 
-    # Mostra i chunk recuperati
     print()
     print("  Chunk recuperati:")
     for i, chunk in enumerate(response.chunks_used, 1):
-        print(f"    [{i}] {chunk.source_name} (score: {chunk.score:.3f})")
+        category = chunk.metadata.get("category", "")
+        cat_str = f" [{category}]" if category else ""
+        print(f"    [{i}]{cat_str} {chunk.source_name} (score: {chunk.score:.3f})")
 
-    # Mostra la risposta
     print()
     print(f"  {response.answer}")
 
-    # Mostra le metriche
     print()
     print(
         f"  ⏱  retrieval: {response.retrieval_time_ms:.0f}ms | "
@@ -159,8 +142,7 @@ def _do_query(rag: RAGService, question: str) -> None:
     print()
 
 
-def _query_loop(ingestion: IngestionService, rag: RAGService, store) -> None:
-    """Loop interattivo di Q&A."""
+def _query_loop(ingestion: IngestionService, rag: RAGService, store: ChromaStore) -> None:
     _print_help()
 
     while True:
@@ -173,13 +155,16 @@ def _query_loop(ingestion: IngestionService, rag: RAGService, store) -> None:
         if not user_input:
             continue
 
-        # Comandi speciali
         if user_input.lower() in ("q", "quit", "exit"):
             print("Ciao.")
             break
 
         if user_input == "/reindex":
             _do_reindex(ingestion, store)
+            continue
+
+        if user_input == "/update":
+            _do_update(ingestion)
             continue
 
         if user_input == "/status":
@@ -190,12 +175,10 @@ def _query_loop(ingestion: IngestionService, rag: RAGService, store) -> None:
             _print_help()
             continue
 
-        # Query RAG
         _do_query(rag, user_input)
 
 
 def main() -> None:
-    """Entry point dell'applicazione CLI."""
     _setup_logging()
     _print_header()
 
@@ -207,7 +190,6 @@ def main() -> None:
         print()
         sys.exit(1)
 
-    # Se il vector store è vuoto, proponi l'indicizzazione
     if store.count() == 0:
         print(f"  Vector store vuoto.")
         print(f"  Cartella documenti: {settings.documents_dir}")
@@ -222,11 +204,10 @@ def main() -> None:
         if answer in ("", "s", "si", "sì", "y", "yes"):
             _do_reindex(ingestion, store)
         else:
-            print("  OK, puoi usare /reindex quando vuoi.\n")
+            print("  OK, puoi usare /reindex o /update quando vuoi.\n")
 
     else:
         print(f"  Vector store caricato: {store.count()} chunk indicizzati.")
         print()
 
-    # Avvia il loop interattivo
     _query_loop(ingestion, rag, store)

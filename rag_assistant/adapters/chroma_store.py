@@ -1,32 +1,9 @@
 """
 Vector store basato su ChromaDB.
 
-ChromaDB è un database vettoriale che salva embedding su disco
-e li recupera per similarità. In questa implementazione:
-
-- I chunk vengono salvati con i loro embedding e metadati
-- La ricerca usa cosine similarity (configurata nella collection)
-- Il database è persistente: sopravvive al riavvio del processo
-- Ogni chunk è identificato dal suo chunk_id (deterministico)
-
-Persistenza:
-    ChromaDB salva i dati in una cartella su disco (default: ./chroma_db).
-    Al riavvio, basta riaprire il PersistentClient sulla stessa cartella
-    e i dati sono ancora lì. Non serve re-indicizzare.
-
-Perché cosine e non L2:
-    L2 (distanza euclidea) misura la distanza "in linea d'aria" tra
-    due punti. Cosine misura l'angolo tra due vettori, ignorando la
-    magnitudine. Per gli embedding testuali, due testi con lo stesso
-    significato possono avere vettori di lunghezza diversa (perché uno
-    è più lungo dell'altro). Cosine li considera simili comunque.
-    L2 li penalizzerebbe.
-
-ChromaDB restituisce DISTANZE, non similarità:
-    Con cosine, distanza = 1 - similarità.
-    Distanza 0 = identici, distanza 2 = opposti.
-    Noi convertiamo: score = 1 - distance, così score 1.0 = perfetto
-    e score 0.0 = irrilevante. Più intuitivo per il debug.
+ChromaDB salva embedding su disco e li recupera per similarità.
+Supporta upsert, ricerca per similarità e query sui metadati
+per l'indicizzazione incrementale.
 """
 
 import logging
@@ -42,15 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 class ChromaStore(VectorStore):
-    """Vector store persistente basato su ChromaDB.
-
-    Args:
-        persist_dir: cartella dove salvare il database.
-                     Default dal config.
-        collection_name: nome della collection ChromaDB.
-                        Una collection è l'equivalente di una "tabella"
-                        in un database relazionale.
-    """
+    """Vector store persistente basato su ChromaDB."""
 
     def __init__(
         self,
@@ -60,15 +29,9 @@ class ChromaStore(VectorStore):
         self.persist_dir = persist_dir or settings.chroma_persist_dir
         self.collection_name = collection_name or settings.collection_name
 
-        # Crea la cartella se non esiste
         Path(self.persist_dir).mkdir(parents=True, exist_ok=True)
 
-        # Client persistente: i dati sopravvivono al riavvio
         self._client = chromadb.PersistentClient(path=self.persist_dir)
-
-        # get_or_create: se la collection esiste la apre,
-        # altrimenti la crea. Evita errori al primo avvio
-        # e al riavvio successivo.
         self._collection = self._client.get_or_create_collection(
             name=self.collection_name,
             metadata={"hnsw:space": "cosine"},
@@ -81,23 +44,7 @@ class ChromaStore(VectorStore):
         )
 
     def add(self, chunks: list[Chunk], embeddings: list[list[float]]) -> None:
-        """Salva chunk con i loro embedding nel vector store.
-
-        Usa upsert invece di add: se un chunk con lo stesso ID esiste
-        già, lo sovrascrive invece di duplicarlo. Questo è fondamentale
-        per il re-indexing: puoi rieseguire l'indicizzazione senza
-        dover prima cancellare tutto.
-
-        I metadati salvati per ogni chunk:
-        - source_name: nome del file di origine (per le citazioni)
-        - doc_id: ID del documento padre (per raggruppamenti)
-        - word_count: numero di parole (per diagnostica)
-        - chunker: tipo di chunker usato (per debug)
-
-        ChromaDB accetta solo metadati con valori str, int, float, bool.
-        I dict annidati non sono supportati, quindi serializziamo
-        solo i campi rilevanti.
-        """
+        """Salva chunk con upsert (sovrascrive se già esistono)."""
         if len(chunks) != len(embeddings):
             raise ValueError(
                 f"Mismatch: {len(chunks)} chunk ma {len(embeddings)} embedding"
@@ -106,8 +53,6 @@ class ChromaStore(VectorStore):
         if not chunks:
             return
 
-        # ChromaDB ha un limite di batch size (~5000).
-        # Per sicurezza processiamo in batch da 500.
         batch_size = 500
 
         for i in range(0, len(chunks), batch_size):
@@ -125,6 +70,7 @@ class ChromaStore(VectorStore):
                         "chunk_index": c.chunk_index,
                         "word_count": c.word_count,
                         "chunker": c.metadata.get("chunker", "unknown"),
+                        "category": c.metadata.get("category", "Generale"),
                     }
                     for c in batch_chunks
                 ],
@@ -135,21 +81,11 @@ class ChromaStore(VectorStore):
             )
 
     def search(self, embedding: list[float], top_k: int = 5) -> list[RetrievedChunk]:
-        """Cerca i chunk più simili a un embedding.
-
-        ChromaDB restituisce i risultati in ordine di distanza
-        crescente (il più vicino prima). Noi convertiamo la
-        distanza in score di similarità (1 - distance) per
-        maggiore leggibilità.
-
-        Se il vector store è vuoto, restituisce una lista vuota
-        invece di crashare.
-        """
+        """Cerca i chunk più simili a un embedding."""
         if self._collection.count() == 0:
             logger.warning("Vector store vuoto, nessun risultato")
             return []
 
-        # Non chiedere più risultati di quanti ce ne sono
         actual_top_k = min(top_k, self._collection.count())
 
         results = self._collection.query(
@@ -160,10 +96,8 @@ class ChromaStore(VectorStore):
 
         retrieved = []
         for i in range(len(results["documents"][0])):
-            # Converti distanza cosine in score di similarità
             distance = results["distances"][0][i]
             score = 1.0 - distance
-
             metadata = results["metadatas"][0][i]
 
             retrieved.append(RetrievedChunk(
@@ -177,13 +111,28 @@ class ChromaStore(VectorStore):
 
         return retrieved
 
-    def clear(self) -> None:
-        """Svuota il vector store eliminando e ricreando la collection.
+    def get_indexed_doc_ids(self) -> set[str]:
+        """Restituisce l'insieme dei doc_id già indicizzati.
 
-        ChromaDB non ha un metodo "delete all". La strategia è:
-        eliminare la collection e ricrearne una nuova con lo stesso
-        nome e le stesse impostazioni.
+        Fondamentale per l'indicizzazione incrementale:
+        se un doc_id è già presente, il file corrispondente
+        può essere saltato.
         """
+        if self._collection.count() == 0:
+            return set()
+
+        # Recupera tutti i metadati senza embedding né documenti
+        all_data = self._collection.get(include=["metadatas"])
+
+        doc_ids = set()
+        for metadata in all_data["metadatas"]:
+            if "doc_id" in metadata:
+                doc_ids.add(metadata["doc_id"])
+
+        return doc_ids
+
+    def clear(self) -> None:
+        """Svuota il vector store."""
         self._client.delete_collection(self.collection_name)
         self._collection = self._client.get_or_create_collection(
             name=self.collection_name,
