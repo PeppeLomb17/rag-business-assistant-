@@ -1,9 +1,9 @@
 """
 Vector store basato su ChromaDB.
 
-ChromaDB salva embedding su disco e li recupera per similarità.
-Supporta upsert, ricerca per similarità e query sui metadati
-per l'indicizzazione incrementale.
+Supporta ricerca per similarità con filtro opzionale sui metadati.
+Il filtro permette di restringere la ricerca a una categoria
+specifica (es: solo DDT PDF, solo Fatture Airone).
 """
 
 import logging
@@ -44,7 +44,6 @@ class ChromaStore(VectorStore):
         )
 
     def add(self, chunks: list[Chunk], embeddings: list[list[float]]) -> None:
-        """Salva chunk con upsert (sovrascrive se già esistono)."""
         if len(chunks) != len(embeddings):
             raise ValueError(
                 f"Mismatch: {len(chunks)} chunk ma {len(embeddings)} embedding"
@@ -80,19 +79,48 @@ class ChromaStore(VectorStore):
                 f"Upsert batch: {min(i + batch_size, len(chunks))}/{len(chunks)}"
             )
 
-    def search(self, embedding: list[float], top_k: int = 5) -> list[RetrievedChunk]:
-        """Cerca i chunk più simili a un embedding."""
+    def search(
+        self,
+        embedding: list[float],
+        top_k: int = 5,
+        category_filter: str | None = None,
+    ) -> list[RetrievedChunk]:
+        """Cerca i chunk più simili, con filtro opzionale per categoria.
+
+        Args:
+            embedding: vettore query.
+            top_k: numero massimo di risultati.
+            category_filter: se specificato, cerca solo in quella categoria.
+                           Es: "DDT PDF", "Fatture Airone", "Generale".
+        """
         if self._collection.count() == 0:
             logger.warning("Vector store vuoto, nessun risultato")
             return []
 
         actual_top_k = min(top_k, self._collection.count())
 
-        results = self._collection.query(
-            query_embeddings=[embedding],
-            n_results=actual_top_k,
-            include=["documents", "metadatas", "distances"],
-        )
+        # Costruisci il filtro per ChromaDB
+        where_filter = None
+        if category_filter:
+            where_filter = {"category": category_filter}
+            logger.info(f"Ricerca filtrata per categoria: {category_filter}")
+
+        try:
+            results = self._collection.query(
+                query_embeddings=[embedding],
+                n_results=actual_top_k,
+                include=["documents", "metadatas", "distances"],
+                where=where_filter,
+            )
+        except Exception as e:
+            # Se il filtro non matcha niente, ChromaDB potrebbe dare errore
+            # Riprova senza filtro
+            logger.warning(f"Filtro '{category_filter}' fallito: {e}. Ricerca senza filtro.")
+            results = self._collection.query(
+                query_embeddings=[embedding],
+                n_results=actual_top_k,
+                include=["documents", "metadatas", "distances"],
+            )
 
         retrieved = []
         for i in range(len(results["documents"][0])):
@@ -112,16 +140,10 @@ class ChromaStore(VectorStore):
         return retrieved
 
     def get_indexed_doc_ids(self) -> set[str]:
-        """Restituisce l'insieme dei doc_id già indicizzati.
-
-        Fondamentale per l'indicizzazione incrementale:
-        se un doc_id è già presente, il file corrispondente
-        può essere saltato.
-        """
+        """Restituisce l'insieme dei doc_id già indicizzati."""
         if self._collection.count() == 0:
             return set()
 
-        # Recupera tutti i metadati senza embedding né documenti
         all_data = self._collection.get(include=["metadatas"])
 
         doc_ids = set()
@@ -131,8 +153,24 @@ class ChromaStore(VectorStore):
 
         return doc_ids
 
+    def get_categories(self) -> set[str]:
+        """Restituisce tutte le categorie presenti nel vector store.
+
+        Utile per /status e per validare i filtri.
+        """
+        if self._collection.count() == 0:
+            return set()
+
+        all_data = self._collection.get(include=["metadatas"])
+
+        categories = set()
+        for metadata in all_data["metadatas"]:
+            if "category" in metadata:
+                categories.add(metadata["category"])
+
+        return categories
+
     def clear(self) -> None:
-        """Svuota il vector store."""
         self._client.delete_collection(self.collection_name)
         self._collection = self._client.get_or_create_collection(
             name=self.collection_name,
@@ -141,5 +179,4 @@ class ChromaStore(VectorStore):
         logger.info("Vector store svuotato")
 
     def count(self) -> int:
-        """Restituisce il numero di chunk indicizzati."""
         return self._collection.count()
