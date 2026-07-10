@@ -150,7 +150,7 @@ class TestRAGService:
         # E la domanda
         assert "Dimmi il prezzo." in llm.last_user_prompt
         # E il system prompt deve essere quello anti-allucinazione
-        assert "ESCLUSIVAMENTE" in llm.last_system_prompt
+        assert "SOLO" in llm.last_system_prompt
 
     def test_query_respects_top_k(self):
         """Il retrieval usa il top_k configurato."""
@@ -284,6 +284,6 @@ class TestRAGService:
 
     def test_default_system_prompt_is_anti_hallucination(self):
         """Il system prompt di default contiene le regole anti-allucinazione."""
-        assert "ESCLUSIVAMENTE" in SYSTEM_PROMPT
+        assert "SOLO" in SYSTEM_PROMPT
         assert "Non inventare" in SYSTEM_PROMPT
-        assert "non ho trovato" in SYSTEM_PROMPT.lower()
+        assert "dillo chiaramente" in SYSTEM_PROMPT.lower()
